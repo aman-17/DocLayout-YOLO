@@ -9,7 +9,18 @@ import numpy as np
 import argparse
 from doclayout_yolo import YOLOv10
 from PIL import Image
+from tqdm import tqdm
+import random
+from typing import Optional
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def parse_pdf_hash(pretty_pdf_path: str) -> Optional[str]:
+    pattern = r"s3://ai2-s2-pdfs/([a-f0-9]{4})/([a-f0-9]+)\.pdf"
+    match = re.match(pattern, pretty_pdf_path)
+    if match:
+        return match.group(1) + match.group(2)
+    return None
 
 def download_pdf_from_s3(s3_path: str, local_path: str) -> bool:
     """
@@ -36,7 +47,6 @@ def download_pdf_from_s3(s3_path: str, local_path: str) -> bool:
     except Exception as e:
         print(f"Error downloading {s3_path}: {str(e)}")
         return False
-    
 
 def extract_page_from_pdf(input_path: str, output_path: str, page_num: int) -> bool:
     """
@@ -68,12 +78,11 @@ def extract_page_from_pdf(input_path: str, output_path: str, page_num: int) -> b
         print(f"Error extracting page {page_num} from {input_path}: {str(e)}")
         raise
 
-
 def get_pdf_media_box_width_height(local_pdf_path: str, page_num: int) -> tuple[float, float]:
     """
     Get the MediaBox dimensions for a specific page in a PDF file using the pdfinfo command.
 
-    :param pdf_file: Path to the PDF file
+    :param local_pdf_path: Path to the PDF file
     :param page_num: The page number for which to extract MediaBox dimensions
     :return: A tuple containing MediaBox dimensions (width, height)
     """
@@ -92,10 +101,9 @@ def get_pdf_media_box_width_height(local_pdf_path: str, page_num: int) -> tuple[
 
     raise ValueError("MediaBox not found in the PDF info.")
 
-
 def render_pdf_to_png(local_pdf_path: str, output_png_path: str, page_num: int, target_longest_image_dim: int = 2048) -> None:
     """
-    Render a PDF page to a PNG file
+    Render a PDF page to a PNG file.
     
     Args:
         local_pdf_path: Path to the PDF file
@@ -128,7 +136,6 @@ def render_pdf_to_png(local_pdf_path: str, output_png_path: str, page_num: int, 
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-
 
 def process_image_with_model(image_path, model_path, conf=0.3, device="cuda:0"):
     """
@@ -173,7 +180,6 @@ def process_image_with_model(image_path, model_path, conf=0.3, device="cuda:0"):
     
     return white_canvas
 
-
 def image_to_pdf(image_array, output_pdf_path):
     """
     Convert a numpy image array to a PDF file.
@@ -192,7 +198,6 @@ def image_to_pdf(image_array, output_pdf_path):
     # Save as PDF
     pil_image.save(output_pdf_path, "PDF", resolution=100.0)
 
-
 def process_pdf(s3_path, temp_dir, output_dir, model_path, conf=0.3, device="cuda:0"):
     """
     Process a single PDF from S3.
@@ -205,8 +210,10 @@ def process_pdf(s3_path, temp_dir, output_dir, model_path, conf=0.3, device="cud
         conf: Confidence threshold for detection
         device: Device to run model on
     """
+    if parse_pdf_hash(s3_path) is None:
+        return
 
-    filename = os.path.basename(s3_path)
+    filename = parse_pdf_hash(s3_path) + ".pdf"
     base_filename = os.path.splitext(filename)[0]
     local_pdf_path = os.path.join(temp_dir, filename)
     
@@ -225,26 +232,27 @@ def process_pdf(s3_path, temp_dir, output_dir, model_path, conf=0.3, device="cud
             num_pages = len(pdf.pages)
         
         print(f"Processing {filename} with {num_pages} pages")
+
+        page_num = random.choice(list(range(num_pages)))
         
-        for page_num in range(num_pages):
-            page_pdf_path = os.path.join(temp_dir, f"{base_filename}_page_{page_num+1}.pdf")
-            page_png_path = os.path.join(temp_dir, f"{base_filename}_page_{page_num+1}.png")
-            output_pdf_path = os.path.join(output_dir, f"{base_filename}_page_{page_num+1}_processed.pdf")
-            
-            print(f"Extracting page {page_num+1}...")
-            extract_page_from_pdf(local_pdf_path, page_pdf_path, page_num)
-            
-            print(f"Converting page {page_num+1} to PNG...")
-            render_pdf_to_png(page_pdf_path, page_png_path, 1)
-            
-            print(f"Processing page {page_num+1} with model...")
-            processed_image = process_image_with_model(page_png_path, model_path, conf, device)
-            
-            print(f"Converting processed image to PDF...")
-            image_to_pdf(processed_image, output_pdf_path)
-            
-            print(f"Page {page_num+1} processed and saved to {output_pdf_path}")
-            
+        page_pdf_path = os.path.join(temp_dir, f"{base_filename}_page_{page_num+1}.pdf")
+        page_png_path = os.path.join(temp_dir, f"{base_filename}_page_{page_num+1}.png")
+        output_pdf_path = os.path.join(output_dir, f"{base_filename}_page_{page_num+1}_processed.pdf")
+        
+        print(f"Extracting page {page_num+1}...")
+        extract_page_from_pdf(local_pdf_path, page_pdf_path, page_num)
+        
+        print(f"Converting page {page_num+1} to PNG...")
+        render_pdf_to_png(page_pdf_path, page_png_path, 1)
+        
+        print(f"Processing page {page_num+1} with model...")
+        processed_image = process_image_with_model(page_png_path, model_path, conf, device)
+        
+        print(f"Converting processed image to PDF...")
+        image_to_pdf(processed_image, output_pdf_path)
+        
+        print(f"Page {page_num+1} processed and saved to {output_pdf_path}")
+        
     except Exception as e:
         print(f"Error processing {s3_path}: {str(e)}")
     finally:
@@ -252,8 +260,6 @@ def process_pdf(s3_path, temp_dir, output_dir, model_path, conf=0.3, device="cud
         for file in os.listdir(temp_dir):
             if file.startswith(base_filename):
                 os.remove(os.path.join(temp_dir, file))
-        pass
-
 
 def main():
     parser = argparse.ArgumentParser(description="Process PDFs with 'abandon' tag detection")
@@ -263,23 +269,50 @@ def main():
     parser.add_argument("--temp_dir", type=str, default="./temp", help="Directory for temporary files")
     parser.add_argument("--conf", type=float, default=0.3, help="Confidence threshold for detection")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to run model on ('cuda:0' or 'cpu')")
+    parser.add_argument("--num_workers", type=int, default=8, help="Number of threads for parallel processing")
     
     args = parser.parse_args()
 
     os.makedirs(args.temp_dir, exist_ok=True)
 
-    with open(args.input_list, "r") as file:
-        s3_paths = [line.strip() for line in file if line.strip()]
-    
-    for s3_path in s3_paths:
-        process_pdf(
-            s3_path=s3_path,
-            temp_dir=args.temp_dir,
-            output_dir=args.output_dir,
-            model_path=args.model_path,
-            conf=args.conf,
-            device=args.device
-        )
+    # Reservoir sampling implementation
+    s3_paths = []
+    with open(args.input_list, "r") as f:
+        for i, line in enumerate(tqdm(f, desc="Reading input list")):
+            line = line.strip()
+            if not line:
+                continue
+
+            if i < 100000:
+                s3_paths.append(line)
+            else:
+                # Randomly replace elements with decreasing probability
+                j = random.randint(0, i)
+                if j < 100000:
+                    s3_paths[j] = line
+
+    print(f"Processing {len(s3_paths)} PDFs with up to {args.num_workers} workers...")
+
+    # Process PDFs in parallel using ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+        futures = [
+            executor.submit(
+                process_pdf,
+                s3_path,
+                args.temp_dir,
+                args.output_dir,
+                args.model_path,
+                args.conf,
+                args.device
+            )
+            for s3_path in s3_paths
+        ]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing PDFs"):
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"Generated an exception: {exc}")
+
     print(f"All PDFs processed. Results saved to {args.output_dir}")
 
 if __name__ == "__main__":
